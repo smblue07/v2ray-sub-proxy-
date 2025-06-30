@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# توقف اسکریپت در صورت بروز خطا
+# توقف اسکریپت در صورت بروز هرگونه خطا
 set -e
 
 echo "================================================="
@@ -26,21 +26,23 @@ deactivate
 
 # ساخت سرویس Gunicorn با systemd
 echo ">>> ساخت سرویس systemd برای اجرای دائمی برنامه..."
-# مسیر کامل به فایل اجرایی gunicorn در محیط مجازی
 GUNICORN_PATH=$(pwd)/venv/bin/gunicorn
-# مسیر کامل به پوشه پروژه
 PROJECT_PATH=$(pwd)
+APP_MODULE="app:app"
 
 sudo tee /etc/systemd/system/subproxy.service > /dev/null <<EOF
 [Unit]
-Description=Gunicorn instance to serve the V2Ray subscription proxy
+Description=Gunicorn instance for V2Ray subscription proxy
 After=network.target
 
 [Service]
-User=root # یا کاربر غیر root که پروژه را اجرا می‌کند
+User=root
 Group=www-data
 WorkingDirectory=$PROJECT_PATH
-ExecStart=$GUNICORN_PATH --workers 3 --bind 127.0.0.1:$APP_PORT app:app
+ExecStart=$GUNICORN_PATH --workers 3 --bind 127.0.0.1:$APP_PORT $APP_MODULE
+Restart=always
+StandardOutput=append:/var/log/subproxy.log
+StandardError=append:/var/log/subproxy.log
 
 [Install]
 WantedBy=multi-user.target
@@ -65,14 +67,15 @@ EOF
 
 # فعال‌سازی سایت در Nginx
 sudo ln -s -f /etc/nginx/sites-available/$SUBDOMAIN /etc/nginx/sites-enabled/
-sudo nginx -t # تست کانفیگ
-sudo systemctl reload nginx
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t
+
+# *** تغییراصلی اینجاست ***
+echo ">>> ری‌استارت کردن Nginx برای اعمال تنظیمات..."
+sudo systemctl restart nginx
 
 # دریافت گواهی SSL با Certbot
 echo ">>> دریافت گواهی SSL برای $SUBDOMAIN..."
-# --non-interactive: اجرای غیرتعاملی
-# --agree-tos: موافقت با شرایط سرویس
-# --redirect: هدایت خودکار http به https
 sudo certbot --nginx -d $SUBDOMAIN --non-interactive --agree-tos -m $EMAIL --redirect
 
 # فعال‌سازی و اجرای نهایی سرویس‌ها
@@ -85,4 +88,6 @@ echo "================================================="
 echo "🎉 نصب با موفقیت انجام شد! 🎉"
 echo "سرویس شما اکنون روی آدرس زیر در دسترس است:"
 echo "https://$SUBDOMAIN"
+echo "برای مشاهده لاگ‌های برنامه، از دستور زیر استفاده کنید:"
+echo "sudo journalctl -u subproxy -f"
 echo "================================================="

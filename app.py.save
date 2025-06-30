@@ -1,0 +1,114 @@
+# app.py (نسخه نهایی با چک کردن وضعیت فعال بودن کلاینت)
+import requests
+import os
+import time
+import jdatetime
+import json
+import sqlite3
+from flask import Flask, render_template, abort
+
+# ================== تنظیمات اصلی ==================
+DB_PATH = '/etc/x-ui/x-ui.db'
+SERVER_IP = 'swe.nagarin.ir' 
+LISTEN_PORT = 5002
+SUBSCRIPTION_PORT = 2083
+SUBSCRIPTION_PATH = '/subscriptionlink/'
+# ===================================================
+
+CACHE_DURATION_SECONDS = 300 
+app = Flask(__name__)
+
+cached_data = {}
+cache_timestamp = {}
+
+def get_db_connection():
+    try:
+        conn = sqlite3.connect(f'file:{DB_PATH}?mode=ro', uri=True)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.Error as e:
+        print(f"Database connection error: {e}")
+        return None
+
+def check_if_subid_exists_and_enabled(sub_id):
+    """بررسی می‌کند که آیا sub_id در دیتابیس وجود دارد و فعال است یا خیر"""
+    conn = get_db_connection()
+    if not conn: return False
+    # فقط اینباندهایی که خودشان فعال هستند را بررسی می‌کنیم
+    inbounds = conn.execute('SELECT settings FROM inbounds WHERE enable = 1').fetchall()
+    conn.close()
+    for inbound in inbounds:
+        try:
+            settings = json.loads(inbound['settings'])
+            for client in settings.get('clients', []):
+                # *** تغییراصلی اینجاست: علاوه بر subId، وضعیت enable خود کلاینت هم چک می‌شود ***
+                if client.get('subId') == sub_id and client.get('enable', False) is True:
+                    return True # فقط در صورتی که کلاینت فعال باشد، تایید کن
+        except (json.JSONDecodeError, KeyError):
+            continue
+    return False
+
+def format_bytes(byte_count):
+    if byte_count is None or byte_count < 0: return "نامشخص"
+    gb = byte_count / (1024**3); return f"{gb:.2f} GB"
+
+def parse_user_info(header_string):
+    info = {};_ = [info.update({key_value[0]: int(key_value[1])}) for part in header_string.split(';') if len(key_value := part.strip().split('=', 1)) == 2 and key_value[1].isdigit()]; return info
+
+def get_subscription_data(url):
+    global cached_data, cache_timestamp
+    current_time = time.time()
+    if url in cached_data and (current_time - cache_timestamp.get(url, 0) < CACHE_DURATION_SECONDS):
+        print(f">>> Using cached data for {url}"); return cached_data[url]
+    print(f">>> Fetching new data from {url}...")
+    try:
+        response = requests.get(url, timeout=10, verify=False)
+        response.raise_for_status()
+        plain_text_content = response.text
+        configs = plain_text_content.splitlines()
+        user_info_header = response.headers.get('subscription-userinfo', '')
+        user_info = parse_user_info(user_info_header)
+        data = {"configs": [c.strip() for c in configs if c.strip()], "user_info": user_info}
+        cached_data[url] = data; cache_timestamp[url] = current_time
+        return data
+    except requests.exceptions.RequestException as e:
+        print(f"ERROR fetching {url}: {e}")
+        if url in cached_data: return cached_data[url]
+        return None
+
+@app.route('/subscriptionlink/<sub_id>')
+def show_subscription_page(sub_id):
+    # 1. بررسی وجود و فعال بودن sub_id در دیتابیس
+    if not check_if_subid_exists_and_enabled(sub_id):
+        abort(404, f"Subscription ID '{sub_id}' not found or is disabled.")
+    
+    source_url = f"https://{SERVER_IP}:{SUBSCRIPTION_PORT}/{SUBSCRIPTION_PATH.strip('/')}/{sub_id}"
+    data = get_subscription_data(source_url)
+    if data is None:
+        abort(500, "Error receiving subscription data from the source server.")
+        
+    info = data.get('user_info', {})
+    used_bytes = info.get('upload', 0) + info.get('download', 0)
+    total = info.get('total', 0)
+    remaining_bytes = total - used_bytes if total > 0 else 0
+    expire_timestamp = info.get('expire')
+    expire_date_str = "نامشخص"
+    if expire_timestamp:
+        try:
+            jalali_date = jdatetime.datetime.fromgregorian(datetime=jdatetime.datetime.fromtimestamp(expire_timestamp))
+            expire_date_str = jalali_date.strftime("%Y/%m/%d")
+        except Exception: pass
+
+    display_info = {"total": format_bytes(total), "used": format_bytes(used_bytes), "remaining": format_bytes(remaining_bytes), "expire_date": expire_date_str}
+    
+    return render_template('viewer.html', configs=data['configs'], info=display_info, todays_date=jdatetime.datetime.now().strftime('%Y/%m/%d'))
+
+# --- بخش ساخت خودکار فایل HTML (بدون تغییر) ---
+templates_dir = 'templates'
+viewer_html_path = os.path.join(templates_dir, 'viewer.html')
+if not os.path.exists(templates_dir): os.makedirs(templates_dir)
+with open(viewer_html_path, 'w', encoding='utf-8') as f: f.write("""
+<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>اطلاعات اشتراک</title><style>@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;700&display=swap');:root { --primary-color: #007bff; --secondary-color: #1a2b4d; --bg-color: #f4f7f9; --card-bg-color: #ffffff; --text-color: #333; --border-color: #dee2e6; } body { font-family: 'Vazirmatn', sans-serif; background-color: var(--bg-color); margin: 0; padding: 2rem; color: var(--text-color); display: flex; justify-content: center; align-items: flex-start; min-height: 100vh; } .main-container { display: flex; flex-direction: row; width: 100%; max-width: 1200px; gap: 2rem; background: var(--card-bg-color); padding: 2rem; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.05); } .info-panel { flex: 1; min-width: 280px; } .links-panel { flex: 2.5; border-right: 1px solid var(--border-color); padding-right: 2rem; } h1, h2 { color: var(--secondary-color); border-bottom: 2px solid var(--primary-color); padding-bottom: 10px; margin-top: 0; } h1 { font-size: 1.8rem; } h2 { font-size: 1.5rem; margin-bottom: 1.5rem; } .info-item { display: flex; justify-content: space-between; align-items: center; font-size: 1.1rem; padding: 14px 5px; border-bottom: 1px solid #f0f0f0; } .info-item span:first-child { font-weight: bold; color: #555; } .info-item span:last-child { font-weight: bold; color: var(--primary-color); direction: ltr; } .links-list { list-style: none; padding: 0; max-height: 65vh; overflow-y: auto; padding-left: 10px; } .links-list li { display: flex; align-items: center; background: #f9fafb; border: 1px solid var(--border-color); padding: 10px 15px; border-radius: 8px; margin-bottom: 10px; } .config-link { flex-grow: 1; font-family: monospace; font-size: 0.9rem; direction: ltr; word-break: break-all; text-align: left; padding-left: 15px; } .copy-btn { background: #28a745; color: white; border: none; border-radius: 5px; padding: 8px 15px; cursor: pointer; font-family: 'Vazirmatn'; font-size: 0.9rem; transition: background-color 0.2s, transform 0.1s; } .copy-btn:hover { background: #218838; } .copy-btn:active { transform: scale(0.95); } .footer-note { margin-top: 1.5rem; font-size: 0.9rem; color: #888; text-align: center; } @media (max-width: 900px) { .main-container { flex-direction: column-reverse; } .links-panel { border-right: none; padding-right: 0; } }</style></head><body><div class="main-container"><div class="links-panel"><h2>لیست کانفیگ‌ها</h2><ul class="links-list">{% for config in configs %}<li><div class="config-link">{{ config }}</div><button class="copy-btn" onclick="copyToClipboard(this, `{{ config }}`)">کپی</button></li>{% else %}<li>هیچ کانفیگی یافت نشد.</li>{% endfor %}</ul></div><div class="info-panel"><h1>اطلاعات اشتراک</h1><div class="info-item"><span>حجم کل</span> <span>{{ info.total }}</span></div><div class="info-item"><span>مصرف شده</span> <span>{{ info.used }}</span></div><div class="info-item"><span>باقی‌مانده</span> <span>{{ info.remaining }}</span></div><div class="info-item"><span>تاریخ انقضا</span> <span>{{ info.expire_date }}</span></div><div class="info-item"><span>تاریخ امروز</span> <span>{{ todays_date }}</span></div><p class="footer-note">در صورتی که مقادیر "نامشخص" هستند، سرور شما این اطلاعات را ارسال نمی‌کند.</p></div></div><script>function copyToClipboard(button, text) { navigator.clipboard.writeText(text).then(() => { const originalText = button.innerHTML; button.innerHTML = 'کپی شد!'; setTimeout(() => { button.innerHTML = originalText; }, 1500); }).catch(err => { alert("خطا در کپی کردن لینک."); }); }</script></body></html>""")
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=LISTEN_PORT)

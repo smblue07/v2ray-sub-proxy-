@@ -1,84 +1,99 @@
-#!/bin/bash
+# app.py
+import requests
+import json
+import sqlite3
+import time
+from flask import Flask, abort, Response
 
-# توقف اسکریپت در صورت بروز هرگونه خطا
-set -e
+# ================== تنظیمات اصلی (این بخش را با دقت ویرایش کنید) ==================
+# 1. مسیر فایل دیتابیس پنل x-ui
+DB_PATH = '/etc/x-ui/x-ui.db'
 
-echo "================================================="
-echo "راه‌اندازی سرویس پراکسی اشتراک (نسخه HTTP)"
-echo "================================================="
+# 2. آدرس دامنه یا IP سرور
+SERVER_IP = 'swe.nagarin.ir' 
 
-# دریافت اطلاعات از کاربر
-read -p "لطفا دامنه یا IP سرور خود را وارد کنید (مثال: sub.domain.com یا 1.2.3.4): " DOMAIN_OR_IP
-read -p "لطفا پورتی که اپلیکیشن روی آن اجرا شود را وارد کنید (مثال: 5002): " APP_PORT
+# 3. پورت و مسیر ثابت برای لینک‌های اشتراک (بر اساس نمونه شما)
+SUBSCRIPTION_PORT = 2083
+SUBSCRIPTION_PATH = '/subscriptionlink/'
+# =================================================================================
 
-# آپدیت سیستم و نصب پیش‌نیازها
-echo ">>> آپدیت سیستم و نصب پیش‌نیازها (nginx, python, pip, venv)..."
-sudo apt-get update
-sudo apt-get install -y nginx python3-pip python3-venv
+CACHE_DURATION_SECONDS = 300 
+app = Flask(__name__)
 
-# نصب پکیج‌های پایتون
-echo ">>> نصب پکیج‌های پایتون از requirements.txt..."
-# ایجاد محیط مجازی
-python3 -m venv venv
-# فعال‌سازی محیط مجازی
-source venv/bin/activate
-# نصب پکیج‌ها
-pip install -r requirements.txt
-# غیرفعال‌سازی محیط مجازی
-deactivate
+# --- متغیرهای گلوبال برای سیستم کش ---
+cached_content = {}
+cache_timestamp = {}
 
-# ساخت سرویس Gunicorn با systemd
-echo ">>> ساخت سرویس systemd برای اجرای دائمی برنامه..."
-GUNICORN_PATH=$(pwd)/venv/bin/gunicorn
-PROJECT_PATH=$(pwd)
-APP_MODULE="app:app"
+def get_db_connection():
+    try:
+        conn = sqlite3.connect(f'file:{DB_PATH}?mode=ro', uri=True)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.Error as e:
+        print(f"Database connection error: {e}")
+        return None
 
-sudo tee /etc/systemd/system/subproxy.service > /dev/null <<EOF
-[Unit]
-Description=Gunicorn instance for V2Ray subscription proxy
-After=network.target
+def check_if_subid_exists_and_enabled(sub_id):
+    """بررسی می‌کند که آیا sub_id در دیتابیس وجود دارد و فعال است یا خیر"""
+    conn = get_db_connection()
+    if not conn: return False
+    inbounds = conn.execute('SELECT settings FROM inbounds WHERE enable = 1').fetchall()
+    conn.close()
+    for inbound in inbounds:
+        try:
+            settings = json.loads(inbound['settings'])
+            for client in settings.get('clients', []):
+                if client.get('subId') == sub_id and client.get('enable', False) is True:
+                    return True
+        except (json.JSONDecodeError, KeyError):
+            continue
+    return False
 
-[Service]
-User=root
-WorkingDirectory=$PROJECT_PATH
-ExecStart=$GUNICORN_PATH --workers 3 --bind 127.0.0.1:$APP_PORT $APP_MODULE
-Restart=always
+def get_raw_subscription_content(url):
+    """محتوای متنی خام لینک اشتراک را با قابلیت کش برمی‌گرداند"""
+    global cached_content, cache_timestamp
+    current_time = time.time()
+    
+    if url in cached_content and (current_time - cache_timestamp.get(url, 0) < CACHE_DURATION_SECONDS):
+        print(f">>> Using cached raw content for {url}")
+        return cached_content[url]
 
-[Install]
-WantedBy=multi-user.target
-EOF
+    print(f">>> Fetching new raw content from {url}...")
+    try:
+        response = requests.get(url, timeout=10, verify=False)
+        response.raise_for_status()
+        
+        raw_text = response.text
+        # آپدیت کردن کش
+        cached_content[url] = raw_text
+        cache_timestamp[url] = current_time
+        return raw_text
+        
+    except requests.exceptions.RequestException as e:
+        print(f"ERROR fetching {url}: {e}")
+        # در صورت خطا، اگر کش قدیمی وجود دارد، آن را برگردان
+        if url in cached_content:
+            return cached_content[url]
+        return None
 
-# کانفیگ Nginx
-echo ">>> کانفیگ Nginx به عنوان Reverse Proxy..."
-sudo tee /etc/nginx/sites-available/subproxy_site > /dev/null <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN_OR_IP;
+@app.route('/subscriptionlink/<sub_id>')
+def proxy_subscription_page(sub_id):
+    # 1. بررسی وجود و فعال بودن sub_id
+    if not check_if_subid_exists_and_enabled(sub_id):
+        abort(404)
+    
+    # 2. ساختن لینک سابسکریپشن اصلی
+    source_url = f"https://{SERVER_IP}:{SUBSCRIPTION_PORT}/{SUBSCRIPTION_PATH.strip('/')}/{sub_id}"
+    
+    # 3. گرفتن محتوای خام از لینک
+    raw_content = get_raw_subscription_content(source_url)
+    
+    if raw_content is None:
+        abort(500, "Could not fetch subscription content from the source server.")
+    
+    # 4. برگرداندن محتوای خام با فرمت صحیح (text/plain)
+    return Response(raw_content, mimetype='text/plain; charset=utf-8')
 
-    location / {
-        proxy_pass http://127.0.0.1:$APP_PORT;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    }
-}
-EOF
-
-# فعال‌سازی سایت در Nginx
-sudo ln -s -f /etc/nginx/sites-available/subproxy_site /etc/nginx/sites-enabled/
-# حذف کانفیگ پیش‌فرض برای جلوگیری از تداخل
-sudo rm -f /etc/nginx/sites-enabled/default
-sudo nginx -t
-sudo systemctl restart nginx
-
-# فعال‌سازی و اجرای نهایی سرویس اپلیکیشن
-echo ">>> فعال‌سازی و اجرای نهایی سرویس..."
-sudo systemctl daemon-reload
-sudo systemctl start subproxy
-sudo systemctl enable subproxy
-
-echo "================================================="
-echo "🎉 نصب با موفقیت انجام شد! 🎉"
-echo "سرویس شما اکنون روی آدرس زیر در دسترس است:"
-echo "http://$DOMAIN_OR_IP"
-echo "================================================="
+# خطوط زیر برای اجرای حرفه‌ای حذف می‌شوند. Gunicorn جایگزین آن است.
+# if __name__ == '__main__':
+#     app.run(host='0.0.0.0', port=LISTEN_PORT)

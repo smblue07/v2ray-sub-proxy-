@@ -17,4 +17,4 @@
 برای نصب این پروژه روی یک سرور خام **Ubuntu 22.04**، کافیست دستور زیر را در ترمینال سرور خود کپی و اجرا کنید.
 
 ```bash
-sudo apt-get update && sudo apt-get install -y git && git clone [https://github.com/smblue07/v2ray-sub-proxy-.git](https://github.com/smblue07/v2ray-sub-proxy-.git) && cd v2ray-sub-proxy- && chmod +x setup.sh && ./setup.sh
+sudo apt-get update && sudo apt-get install -y git && git clone https://github.com/smblue07/v2ray-sub-proxy-.git && cd v2ray-sub-proxy- && chmod +x setup.sh && ./setup.sh

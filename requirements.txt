@@ -1,5 +1,3 @@
-# requirements.txt
 Flask
 requests
-jdatetime
 gunicorn
